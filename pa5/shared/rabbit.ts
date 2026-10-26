@@ -86,6 +86,6 @@ export function getRetryCount(msg: ConsumeMessage): number {
     return 0;
   }
 
-  return xDeath.reduce((sum, entry) => sum + (Number(entry?.count) || 0), 0);
+  return xDeath.filter((e) => (e as { reason?: string })?.reason === "rejected").reduce((sum, entry) => sum + (Number(entry?.count) || 0), 0);
 }
 export function withoutRetryHistory(headers: Record<string, unknown> | undefined): Record<string, unknown> { const kept: Record<string, unknown> = {}; for (const [key, value] of Object.entries(headers ?? {})) { if (key === "x-death" || key.startsWith("x-first-death-") || key.startsWith("x-last-death-")) continue; kept[key] = value; } return kept; }
