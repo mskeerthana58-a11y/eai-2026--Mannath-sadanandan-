@@ -94,3 +94,14 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  # The contract linter. Not part of the running stack: `up` never starts it.
+  # Run it with `docker compose run --rm spectral`, from this folder, in any
+  # shell. See README.md §3.
+  spectral:
+    image: stoplight/spectral:6.16.3
+    profiles: ["tools"]
+    working_dir: /w
+    volumes:
+      - ./:/w:ro
+    command: ["lint", "openapi.yaml", "--ruleset", ".spectral.yaml"]
