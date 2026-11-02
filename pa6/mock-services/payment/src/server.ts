@@ -56,7 +56,7 @@ app.get("/health", (_req: Request, res: Response) => {
 
 app.post("/payment/authorize", (req: Request, res: Response) => {
   const { orderId, amount } = req.body || {};
-  if (!orderId || typeof amount !== "number") {
+  if (!orderId || typeof amount !== "string" || !/^[0-9]+\.[0-9]{2}$/.test(amount)) {
     record("authorize", req, req.body, "validation_error");
     res.status(400).json({ code: "validation_error", message: "orderId and numeric amount are required" });
     return;
