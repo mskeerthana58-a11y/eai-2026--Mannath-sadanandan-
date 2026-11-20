@@ -210,6 +210,45 @@ app.use((err, _req, res, _next) => {
   res.status(400).json({ code: 'validation_error', message: err.message });
 });
 
+
+// ---- following the saga's lifecycle (README §4.4) ----------------------------------------------
+const STATUS_QUEUE = 'intake.status';
+const TERMINAL = new Set(['completed', 'failed', 'compensated', 'duplicate']);
+const FROM_PROCESSING = ['parked', 'completed', 'failed', 'compensated', 'compensation_failed', 'needs_attention'];
+
+function canMove(from, to) {
+  if (from === to || TERMINAL.has(from)) return false;
+  switch (from) {
+    case 'accepted': return true;
+    case 'processing': return FROM_PROCESSING.includes(to);
+    case 'parked': return to === 'processing' || FROM_PROCESSING.includes(to);
+    case 'compensation_failed':
+    case 'needs_attention': return to === 'compensated' || to === 'compensation_failed';
+    default: return false;
+  }
+}
+
+async function onOutcome(msg, ch) {
+  let env;
+  try { env = JSON.parse(msg.content.toString('utf8')); } catch { ch.ack(msg); return; }
+  const view = env && orders.data[env.correlationId];
+  const to = String(msg.fields.routingKey || '').replace(/^order\./, '') || env?.state;
+  if (view && canMove(view.state, to)) {
+    view.state = to;
+    view.updatedAt = env.occurredAt || new Date().toISOString();
+    if (env.code !== undefined) view.code = env.code; else delete view.code;
+    if (env.duplicateOf !== undefined) view.duplicateOf = env.duplicateOf;
+    await orders.save();
+  }
+  ch.ack(msg);
+}
+
+broker.onReady(async (ch) => {
+  await ch.assertQueue(STATUS_QUEUE, { durable: true });
+  await ch.bindQueue(STATUS_QUEUE, 'orders.outcome', '#');
+});
+broker.consume(STATUS_QUEUE, onOutcome, 20);
+
 process.on('unhandledRejection', (e) => console.error('[intake] unhandled rejection:', e));
 app.listen(PORT, () => console.log(`[intake] listening on ${PORT}`));
 broker.start();
