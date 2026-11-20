@@ -10,6 +10,7 @@ import { Broker, healthHandler } from '../shared/broker.mjs';
 import { JsonStore } from '../shared/store.mjs';
 import { makeHop, emitHops } from '../shared/trace.mjs';
 import { translateB2B, translateMobile, translateWeb } from './translate.mjs';
+import { getRetryCount, withoutRetryHistory } from '../shared/retry.mjs';
 
 const PORT = Number(process.env.PORT || 8800);
 const PRICING_URL = (process.env.PRICING_URL || 'http://pricing:4100').replace(/\/+$/, '');
@@ -203,6 +204,110 @@ app.get('/orders/:correlationId', (req, res) => {
   const view = orders.data[req.params.correlationId];
   if (!view) return res.status(404).json({ code: 'not_found', message: 'unknown correlationId' });
   return res.status(200).json(view);
+});
+
+
+// ---- DLQ operations (README §4.6) -----------------------------------------------------------
+const DLQ_QUEUE = 'orders.dlq';
+let dlqChain = Promise.resolve();
+/** One DLQ operation at a time: a peek holds every message unacked, so two must not overlap. */
+const exclusive = (fn) => { const run = dlqChain.then(fn, fn); dlqChain = run.catch(() => {}); return run; };
+
+async function takeAll(ch) {
+  const msgs = [];
+  for (let i = 0; i < 10000; i++) {
+    const m = await ch.get(DLQ_QUEUE, { noAck: false });
+    if (!m) break;
+    msgs.push(m);
+  }
+  return msgs;
+}
+
+function entryOf(m) {
+  const h = m.properties.headers || {};
+  const str = (v) => (typeof v === 'string' && v !== '' ? v : undefined);
+  const attempts = Number.isInteger(h.attempts) && h.attempts >= 1 ? h.attempts : getRetryCount(m) + 1;
+  const at = str(h.deadLetteredAt) || (m.properties.timestamp ? new Date(m.properties.timestamp * 1000).toISOString() : new Date().toISOString());
+  return {
+    messageId: str(m.properties.messageId) || '',
+    correlationId: str(h.correlationId) || '',
+    originQueue: str(h.originQueue) || 'unknown',
+    attempts,
+    lastError: str(h.lastError) || 'unknown',
+    deadLetteredAt: at,
+  };
+}
+
+const confirmPublish = (ch, exchange, key, content, options) =>
+  new Promise((resolve, reject) => ch.publish(exchange, key, content, options, (err) => (err ? reject(err) : resolve())));
+
+async function withDlqChannel(fn) {
+  if (!broker.up || !broker.conn) { const e = new Error('broker_unavailable'); e.status = 503; throw e; }
+  const ch = await broker.conn.createConfirmChannel();
+  ch.on('error', () => {}); // a closed channel hands its unacked messages back
+  try { return await fn(ch); } finally { await ch.close().catch(() => {}); }
+}
+
+app.get('/dlq', async (_req, res) => {
+  try {
+    const entries = await exclusive(() => withDlqChannel(async (ch) => {
+      const msgs = await takeAll(ch);
+      const list = msgs.map(entryOf);
+      for (const m of msgs) ch.nack(m, false, true); // look, do not take (R-4.6.2)
+      return list;
+    }));
+    res.status(200).json({ count: entries.length, entries });
+  } catch (e) {
+    res.status(e.status || 503).json({ code: 'broker_unavailable', message: e.message });
+  }
+});
+
+app.post('/dlq/replay', express.json({ limit: '100kb' }), async (req, res) => {
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  if (body.correlationId !== undefined && (typeof body.correlationId !== 'string' || body.correlationId === '')) {
+    return res.status(400).json({ code: 'validation_error', message: 'correlationId must be a non-empty string' });
+  }
+  try {
+    const out = await exclusive(() => withDlqChannel(async (ch) => {
+      const msgs = await takeAll(ch);
+      let replayed = 0;
+      let remaining = 0;
+      let failed = false;
+      for (const m of msgs) {
+        const e = entryOf(m);
+        const wanted = body.correlationId === undefined || e.correlationId === body.correlationId;
+        if (failed || !wanted || e.originQueue === 'unknown') { ch.nack(m, false, true); remaining++; continue; }
+        const h = m.properties.headers || {};
+        const started = new Date();
+        const hopId = randomUUID();
+        const headers = withoutRetryHistory(h);
+        delete headers.attempts;
+        delete headers.deadLetteredAt;
+        headers.causationId = hopId;
+        try {
+          await confirmPublish(ch, 'orders.return.exchange', e.originQueue, m.content, {
+            persistent: true, contentType: m.properties.contentType, messageId: randomUUID(), headers,
+          });
+        } catch {
+          ch.nack(m, false, true); remaining++; failed = true; continue;
+        }
+        ch.ack(m); // only after the broker confirmed the republish (R-4.6.5)
+        replayed++;
+        if (e.correlationId) {
+          emitHops(broker, [makeHop({
+            hopId, correlationId: e.correlationId, causationId: typeof h.causationId === 'string' ? h.causationId : null,
+            service: 'intake', operation: 'dlq.replay', startedAt: started, finishedAt: new Date(),
+            detail: { originQueue: e.originQueue },
+          })]);
+        }
+      }
+      return { replayed, remaining, failed };
+    }));
+    if (out.failed) return res.status(503).json({ code: 'broker_unavailable', replayed: out.replayed, remaining: out.remaining });
+    return res.status(200).json({ replayed: out.replayed, remaining: out.remaining });
+  } catch (e) {
+    return res.status(e.status || 503).json({ code: 'broker_unavailable', message: e.message });
+  }
 });
 
 app.use((err, _req, res, _next) => {

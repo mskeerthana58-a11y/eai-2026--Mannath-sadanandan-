@@ -4,7 +4,7 @@ import express from 'express';
 import { Broker, healthHandler } from '../shared/broker.mjs';
 import { JsonStore } from '../shared/store.mjs';
 import { makeHop, emitHops } from '../shared/trace.mjs';
-import { getRetryCount } from '../shared/retry.mjs';
+import { getRetryCount, withoutRetryHistory } from '../shared/retry.mjs';
 import { loadOrderValidator } from '../shared/canonical.mjs';
 
 const env = process.env;
@@ -277,10 +277,10 @@ async function runSaga(cid, bk, order, msg, ch, flow, consumeId, attempt, existi
       ch.nack(msg, false, false);
       return;
     }
-    const dlId = flow.add('saga.dead_letter', { status: 'dead_lettered', cause: consumeId });
+    const dlId = flow.add('saga.dead_letter', { status: 'dead_lettered' });
     await broker.publish('orders.dlq.exchange', '', msg.content, {
       persistent: true, contentType: 'application/json', messageId: randomUUID(),
-      headers: { ...(msg.properties.headers || {}), originQueue: 'saga.queue', lastError: `${name} ${r.status ?? r.code}`, causationId: dlId },
+      headers: { ...withoutRetryHistory(msg.properties.headers), originQueue: 'saga.queue', lastError: `${name} ${r.status ?? r.code}`, causationId: dlId, attempts: attempt, deadLetteredAt: iso() },
     });
     await emitOutcome(cid, baseOf(order), 'parked', { code: r.code }, flow);
     ch.ack(msg);
